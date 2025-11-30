@@ -5,6 +5,8 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <cstring>
+#include <cstdint>
+#include <cstdio>
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -127,6 +129,13 @@ bool receiveFile(SOCKET sock)
     for (int i = 0; i < 8; i++)
         fileSize |= ((long long)(sizeBuf[i] & 0xFF)) << (i * 8);
 
+    // Receive CRC32 (4 bytes, little-endian)
+    char crcBuf[4];
+    if (!recvExactBytes(sock, crcBuf, 4))
+        return false;
+    uint32_t expectedCrc = (uint32_t)(uint8_t)crcBuf[0] | ((uint32_t)(uint8_t)crcBuf[1] << 8) |
+                           ((uint32_t)(uint8_t)crcBuf[2] << 16) | ((uint32_t)(uint8_t)crcBuf[3] << 24);
+
     std::cout << "Receiving file: " << filename << " (" << fileSize << " bytes)\n";
 
     // Generate output filename with _copy suffix
@@ -145,8 +154,33 @@ bool receiveFile(SOCKET sock)
         return false;
     }
 
+    // CRC32 computation while receiving
+    // Simple CRC32 implementation (polynomial 0xEDB88320)
+    static uint32_t crc_table[256];
+    static bool crc_table_init = false;
+    if (!crc_table_init)
+    {
+        for (uint32_t i = 0; i < 256; ++i)
+        {
+            uint32_t c = i;
+            for (int j = 0; j < 8; ++j)
+                c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : (c >> 1);
+            crc_table[i] = c;
+        }
+        crc_table_init = true;
+    }
+
+    auto crc32_update = [&](uint32_t crc, const char *buf, size_t len) -> uint32_t
+    {
+        uint32_t c = crc ^ 0xFFFFFFFFu;
+        for (size_t k = 0; k < len; ++k)
+            c = crc_table[(c ^ (unsigned char)buf[k]) & 0xFFu] ^ (c >> 8);
+        return c ^ 0xFFFFFFFFu;
+    };
+
     char chunk[CHUNK_SIZE];
     long long recvd = 0;
+    uint32_t runningCrc = 0xFFFFFFFFu;
     while (recvd < fileSize)
     {
         int toRecv = (fileSize - recvd > CHUNK_SIZE) ? CHUNK_SIZE : static_cast<int>(fileSize - recvd);
@@ -156,10 +190,29 @@ bool receiveFile(SOCKET sock)
             return false;
         }
         outfile.write(chunk, toRecv);
+        // Update CRC
+        runningCrc = crc32_update(runningCrc, chunk, toRecv);
         recvd += toRecv;
     }
 
+    // finalize runningCrc (crc32_update already returns finalized form when given initial 0xFFFFFFFF)
+    uint32_t computedCrc = runningCrc;
+
     outfile.close();
+
+    if (computedCrc != expectedCrc)
+    {
+        std::cerr << "File corruption detected! Expected CRC: 0x" << std::hex << expectedCrc
+                  << ", Computed CRC: 0x" << computedCrc << std::dec << "\n";
+        // Rename file to indicate corruption
+        std::string corruptName = outFilename + ".corrupt";
+        if (std::rename(outFilename.c_str(), corruptName.c_str()) == 0)
+            std::cerr << "Saved corrupted file as: " << corruptName << "\n";
+        else
+            std::cerr << "Failed to rename corrupted file. Left as: " << outFilename << "\n";
+        return false;
+    }
+
     std::cout << "File received and saved: " << outFilename << "\n";
     return true;
 }

@@ -12,6 +12,8 @@
 #include <condition_variable>
 #include <atomic>
 #include <functional>
+#include <cstdint>
+#include <cstdio>
 
 #pragma comment(lib, "ws2_32.lib") // link winsock library
 
@@ -99,6 +101,61 @@ bool sendFile(SOCKET sock, const std::string &filename, const std::string &filep
         sizeBuf[i] = (fileSize >> (i * 8)) & 0xFF;
     if (!sendAllBytes(sock, sizeBuf, 8))
         return false;
+
+    // Compute CRC32 for the file (so receiver can verify integrity)
+    // CRC32 polynomial 0xEDB88320
+    static uint32_t crc_table[256];
+    static bool crc_table_init = false;
+    if (!crc_table_init)
+    {
+        for (uint32_t i = 0; i < 256; ++i)
+        {
+            uint32_t c = i;
+            for (int j = 0; j < 8; ++j)
+                c = (c & 1) ? 0xEDB88320u ^ (c >> 1) : (c >> 1);
+            crc_table[i] = c;
+        }
+        crc_table_init = true;
+    }
+
+    auto crc32_update = [&](uint32_t crc, const char *buf, size_t len) -> uint32_t
+    {
+        uint32_t c = crc ^ 0xFFFFFFFFu;
+        for (size_t k = 0; k < len; ++k)
+            c = crc_table[(c ^ (unsigned char)buf[k]) & 0xFFu] ^ (c >> 8);
+        return c ^ 0xFFFFFFFFu;
+    };
+
+    // Read through file to compute CRC
+    uint32_t runningCrc = 0xFFFFFFFFu;
+    infile.clear();
+    infile.seekg(0, std::ios::beg);
+    char crcChunk[CHUNK_SIZE];
+    long long scanned = 0;
+    while (scanned < fileSize)
+    {
+        int toRead = (fileSize - scanned > CHUNK_SIZE) ? CHUNK_SIZE : static_cast<int>(fileSize - scanned);
+        infile.read(crcChunk, toRead);
+        std::streamsize r = infile.gcount();
+        if (r <= 0)
+            break;
+        runningCrc = crc32_update(runningCrc, crcChunk, static_cast<size_t>(r));
+        scanned += r;
+    }
+    uint32_t fileCrc = runningCrc;
+
+    // Send CRC32 (4 bytes, little-endian)
+    char crcBuf[4];
+    crcBuf[0] = (fileCrc >> 0) & 0xFF;
+    crcBuf[1] = (fileCrc >> 8) & 0xFF;
+    crcBuf[2] = (fileCrc >> 16) & 0xFF;
+    crcBuf[3] = (fileCrc >> 24) & 0xFF;
+    if (!sendAllBytes(sock, crcBuf, 4))
+        return false;
+
+    // Rewind file back to start and send file data in chunks
+    infile.clear();
+    infile.seekg(0, std::ios::beg);
 
     // Send file data in chunks
     char chunk[CHUNK_SIZE];
